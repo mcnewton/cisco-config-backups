@@ -1,0 +1,15 @@
+Cisco switch config file backup script
+======================================
+
+This script allows network backups of Cisco switches. It stores the configs
+in subversion repositories. The diff between the previous and current configs
+is output on stdout, so if run from cron will e-mail the config changes.
+
+Config files in etc/ define the switches to backup. A "group" of switches
+defines the directory that those switch configs are put in. Each group has a
+separate subversion repository, created automatically by the script.
+
+Matthew Newton
+University of Leicester
+25 October 2013
+
