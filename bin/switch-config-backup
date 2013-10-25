@@ -1,0 +1,245 @@
+#! /bin/bash
+#
+# Backup config files from switches with SNMP "write net" command
+# Matthew Newton
+# University of Leicester, 24 August 2005
+# Rewritten 12 October 2011
+#
+# Switch config needs to contain something like the following (where 10.99.0.4
+# is the IP of this server, which also has a tftp server installed). Note the
+# IP is also in the SNMP OID.
+#
+#   access-list 1 permit 10.99.0.4
+#   access-list 1 deny   any log
+#   snmp-server view writenet lsystem.54.0 included
+#   snmp-server view writenet lsystem.55.10.99.0.4 included
+#   snmp-server community lenssbackup view writenet RW 1
+#   snmp-server tftp-server-list 1
+#
+# If the new switch config is different to the previously backed-up config, the
+# switch will be sent the SNMP command to write config to nvram.
+
+# TFTP files will appear in this directory
+TFTPDIR=/srv/tftpboot
+
+# Base directory for all other stuff
+CONFDIR=/opt/confbackups
+
+# Where the config files are placed
+CFDIR=$CONFDIR/dat
+
+# Location of SVN repository
+SVNDIR=$CONFDIR/svn
+
+# Where config files live
+ETCDIR=$CONFDIR/etc
+
+# Where to write the SNMP logs to
+LOG="$CONFDIR/var/log"
+
+DATE=`date +%Y%m%d-%H%M%S`
+BDIR="$CONFDIR/$DATE"
+WRMEMOID=".1.3.6.1.4.1.9.2.1.54.0"
+GETCFOID=".1.3.6.1.4.1.9.2.1.55"
+DEFAULT_INTERFACE="eth0"
+
+# This gets the IP address of the specified ethernet interface, which
+# is used to tell the switch which IP to write the config back to. Note the IP must
+# be listed in the switch SNMP config (see top of this script).
+#
+function getmyip() {
+  /sbin/ifconfig "$1" | awk -F: '/inet addr:/ { print $2 }' | cut -f1 -d' '
+}
+
+function get_configs() {
+  local CFILE
+  local NAME
+  local IP
+  local COMMUNITY
+  local EXTRA
+  local LCOUNT
+  local DFLT_COMM
+  local DFLT_GROUP
+  local LOCALIP
+
+  DFLT_COMM="public"
+  DFLT_GROUP="default"
+  LOCALIP=`getmyip "$DEFAULT_INTERFACE"`
+
+  for CFILE in $ETCDIR/*; do
+    exec 5< <(egrep -v '^( *#| *$)' "$CFILE")
+    LCOUNT=0
+
+    while read -u5 NAME IP COMMUNITY GROUP EXTRA; do
+      LCOUNT=`expr $LCOUNT + 1`
+
+      case "$NAME" in
+        %community)
+          DFLT_COMM="$IP"
+          ;;
+        %group)
+          DFLT_GROUP="$IP"
+          ;;
+        %interface)
+          LOCALIP=`getmyip $IP`
+          ;;
+        *)
+          [ -n "$EXTRA" ] && echo "too many args on line $LCOUNT in $CFILE" 1>&2
+
+          [ -z "$COMMUNITY" ] && COMMUNITY="$DFLT_COMM"
+          [ -z "$GROUP" ] && GROUP="$DFLT_GROUP"
+
+          echo "$NAME" "$IP" "$COMMUNITY" "$GROUP" "$LOCALIP"
+      esac
+    done
+
+    exec 5<&-
+  done
+}
+
+function check_group() {
+  local GROUP
+  GROUP="$1"
+
+  if [ ! -d "$SVNDIR/$GROUP" ]; then
+    svnadmin create "$SVNDIR/$GROUP"
+  fi
+
+  if [ ! -d "$CFDIR/$GROUP" ]; then
+    svn co -q "file://$SVNDIR/$GROUP" "$CFDIR/$GROUP"
+  fi
+}
+
+function get_sw_config() {
+  local IP
+  local COMMUNITY
+  local FILE
+  local LOCALIP
+  local TEMPFILE
+  local NAME
+  local OID
+
+  IP="$1"
+  COMMUNITY="$2"
+  FILE="$3"
+  LOCALIP="$4"
+
+  OID="$GETCFOID.$LOCALIP"
+  TEMPFILE=`/bin/tempfile -d $TFTPDIR -s .backup -m 0666`
+
+  NAME=`basename $TEMPFILE`
+  chmod 666 "$TEMPFILE"
+
+  # write net
+  if snmpset -t30 -r2 -v1 -c "$COMMUNITY" "$IP" "$OID" s "$NAME" >> $LOG 2>&1; then
+    cat "$TEMPFILE" > $FILE
+    rm "$TEMPFILE"
+  else
+    return 1
+  fi
+}
+
+# Check permissions and group for files here
+
+function newfile() {
+  local FILE
+  FILE="$1"
+
+  if [ ! -e "$FILE" ]; then
+    touch "$FILE"
+    chmod 640 "$FILE"
+    chgrp staff "$FILE"
+    return 0
+  fi
+
+  return 1
+}
+
+function report_diff() {
+  local NAME
+  local GROUP
+  local FILE
+  local DIFF
+
+  NAME="$1"
+  GROUP="$2"
+  FILE="$3"
+
+  DIFF=`svn diff "$FILE"`
+
+  DIFF=$(diff -Nau <(svn cat "$FILE" | tail -n +6 | grep -v 'ntp clock-period') \
+                   <(tail -n +6 "$FILE" | grep -v 'ntp clock-period')  2>&1)
+
+  if [ -n "$DIFF" ]; then
+    echo
+    echo
+    echo "======================================================================"
+    echo "Switch config changed for $NAME in group $GROUP"
+    echo "======================================================================"
+    echo
+    echo "$DIFF"
+    echo "config changed, diff output" >> $LOG
+    return 0
+  fi
+
+  return 1
+}
+
+function write_memory() {
+  local NAME
+  local IP
+  local COMMUNITY
+
+  NAME="$1"
+  IP="$2"
+  COMMUNITY="$3"
+
+  echo "----------------------------------------------------------------------"
+  echo "Writing switch config to flash on $NAME"
+  snmpset -t30 -r2 -v1 -c "$COMMUNITY" "$IP" $WRMEMOID i 1 >> $LOG 2>&1
+}
+
+echo "Backup started `date`" >> $LOG
+
+exec 3<&0
+exec 0< <(get_configs)
+
+while read NAME IP COMMUNITY GROUP LOCALIP; do
+  echo "name:$NAME ip:$IP group:$GROUP local_ip:$LOCALIP" >> $LOG
+  
+  check_group "$GROUP"
+
+  unset SVN_ADD
+  unset SW_WRITE
+  newfile "$CFDIR/$GROUP/$NAME" && SVN_ADD=1
+
+  if get_sw_config "$IP" "$COMMUNITY" "$CFDIR/$GROUP/$NAME" "$LOCALIP"; then
+
+    if [ -n "$SVN_ADD" ]; then
+      svn add -q "$CFDIR/$GROUP/$NAME"
+      echo
+      echo
+      echo "======================================================================"
+      echo "New config file $NAME in group $GROUP"
+      echo "======================================================================"
+      echo "added new file $GROUP/$NAME" >> $LOG
+    else
+      report_diff "$NAME" "$GROUP" "$CFDIR/$GROUP/$NAME" && SW_WRITE=1
+    fi
+
+    svn ci -q -m "$NAME $IP on `/bin/date +%Y%m%d-%H%M%S`" "$CFDIR/$GROUP/$NAME"
+
+  else
+    echo "error backing up switch $NAME $IP" 1>&2
+  fi
+
+  [ -n "$SW_WRITE" ] && write_memory "$NAME" "$IP" "$COMMUNITY"
+
+done
+
+exec 0<&3
+exec 3<&-
+
+echo "Backup completed `date`" >> $LOG
+echo "" >> $LOG
+

@@ -1,0 +1,2 @@
+Config backups will be put in this directory, in subdirectories of the
+name of the group (defined in the config files in etc/)

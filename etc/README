@@ -1,0 +1,23 @@
+# README for switch backup config
+
+# All files in this directory are treated as config files (so this
+# readme needs to have all lines commented out, which is as usual
+# with lines commencing with a hash)
+
+# lines are fields:
+#
+#   name  ip  community  group
+#
+# where "name" and "ip" are mandatory
+
+# defaults can be set with
+#
+# %community public
+# %group groupname
+# %interface eth0
+#
+# and are used from that point onwards in the config file
+
+# (interface is used to find the IP address that the switch is
+# told to write the config file back to)
+
